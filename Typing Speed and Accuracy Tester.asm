@@ -80,6 +80,10 @@ main proc
     mov ax, @data
     mov ds, ax
 
+    ; Force 80x25 colour text mode (mode 3) once at startup.
+    mov ax, 0003h
+    int 10h
+
     ; 1. Intro (shown once, skipped on retry).
     lea dx, welcome_msg
     mov ah, 09h
@@ -99,8 +103,7 @@ restart_point:
     mov total_correct, 0
 
     ; 2. Countdown "3 2 1 START" (before the timer, so setup time is free).
-    mov ax, 0003h
-    int 10h
+    call clear_screen
     lea dx, count_msg
     mov ah, 09h
     int 21h
@@ -137,8 +140,7 @@ countdown_loop:
 
 round_start:
     ; 4. Clear screen.
-    mov ax, 0003h
-    int 10h
+    call clear_screen
 
     ; 5. "=== Round X / 3 ==="
     lea dx, round_msg
@@ -301,8 +303,7 @@ calculate:
     cmp total_typed, 0
     je end_program
 
-    mov ax, 0003h
-    int 10h
+    call clear_screen
 
     lea dx, res_top
     mov ah, 09h
@@ -568,5 +569,33 @@ set_cur:
     pop ax
     ret
 putchar_attr endp
+
+; =============================================================================
+;  clear_screen : blank the whole 80x25 window to attribute 07h and home the
+;  cursor.  Uses INT 10h/06h (scroll up, AL=0 = clear) which RESETS the colour
+;  attribute of every cell - unlike a same-mode set, which can leave stale
+;  attributes behind and make later teletype text inherit old colours.
+;  All registers preserved.
+; =============================================================================
+clear_screen proc
+    push ax
+    push bx
+    push cx
+    push dx
+    mov ax, 0600h           ; AH=06 scroll up, AL=00 -> clear entire window
+    mov bh, 07h             ; blanked cells get attribute 07h (grey on black)
+    mov cx, 0000h           ; top-left  = (row 0, col 0)
+    mov dx, 184Fh           ; bottom-right = (row 24, col 79)
+    int 10h
+    mov ah, 02h             ; move cursor home
+    mov bh, 00h
+    mov dx, 0000h
+    int 10h
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+clear_screen endp
 
 end main
