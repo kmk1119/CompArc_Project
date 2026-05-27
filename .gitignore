@@ -1,0 +1,15 @@
+# --- 문서 / 교재 (커밋 제외) ---
+*.pdf
+
+# --- EMU8086 / 어셈블 빌드 산출물 ---
+*.exe
+*.exe_
+*.com
+*.bin
+*.obj
+*.lst
+*.list
+*.map
+*.debug
+*.symbol
+*.~asm
