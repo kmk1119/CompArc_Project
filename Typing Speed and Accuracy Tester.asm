@@ -1,281 +1,572 @@
+; =============================================================================
+;  Typing Speed and Accuracy Tester  (3-round, 8086, EMU8086/DOS)
+;  Reports CPM, WPM, accuracy, per-round breakdown and elapsed time.
+;
+;  Feature set:
+;    A) WPM beside CPM; red/white colour echo; 3-2-1 countdown; retry/quit
+;    B) per-round results + correct/typed counts; one-decimal elapsed time
+;    C) extended-key (arrow/F-key) filtering; ESC to abort; empty-Enter guard
+;
+;  NOTE: comments are ASCII-only (the original CP949 Korean comments showed
+;  up as mojibake). Comments never affect the assembled code.
+; =============================================================================
 .model small
 .stack 100h
 
 .data
-    ; 시작 및 안내 메시지
-    welcome_msg db 'Welcome to Typing Speed Tester!!', 13, 10, '$'
-    prompt_msg db 'Press any key to start...', 13, 10, '$'
+    ; --- Intro / prompt strings --------------------------------------------
+    welcome_msg  db 'Welcome to Typing Speed Tester!!', 13, 10, '$'
+    prompt_msg   db 'Press any key to start...', 13, 10, '$'
     input_prompt db 13, 10, 13, 10, 'Type here: $'
-    
-    ; 3개의 긴 전공 제시문
+
+    ; --- Countdown / retry UI ----------------------------------------------
+    count_msg db 'Get ready! Starting in ... $'
+    start_msg db 13, 10, 13, 10, '   START!', 13, 10, '$'
+    again_msg db 13, 10, 13, 10, ' Press R to retry, ESC to quit.$'
+
+    ; --- Three target sentences --------------------------------------------
     target1 db 'Welcome to Hankuk University of Foreign Studies Computer Science!', 13, 10, '$'
     target2 db 'Understanding Big-O complexity is crucial for dynamic programming.', 13, 10, '$'
     target3 db 'Convolutional Neural Networks excel at recognizing image features.', 13, 10, '$'
-    
-    ; [신규] 라운드 관리를 위한 배열 및 변수
-    target_ptrs dw offset target1, offset target2, offset target3
-    current_round dw 0      ; 현재 진행 중인 라운드 (0, 1, 2)
-    selected_target dw ?    ; 현재 라운드의 제시문 주소
-    
-    ; [신규] 3라운드 전체 성적을 누적할 변수
-    total_typed dw 0        ; 전체 입력한 글자 수
-    total_correct dw 0      ; 전체 맞은 글자 수
-    
-    ; 라운드 UI 텍스트
+
+    target_ptrs     dw offset target1, offset target2, offset target3
+    current_round   dw 0
+    selected_target dw ?
+
+    ; --- Aggregate + per-round statistics ----------------------------------
+    total_typed   dw 0
+    total_correct dw 0
+    round_typed   dw 3 dup(0)   ; characters typed in each round
+    round_correct dw 3 dup(0)   ; correct characters in each round
+
+    ; --- Round header UI ----------------------------------------------------
     round_msg db '=== Round $'
     round_max db ' / 3 ===', 13, 10, 13, 10, '$'
-    
-    ; 결과창 UI 디자인 텍스트
-    res_top db 13, 10, 13, 10, '=============================', 13, 10, '    FINAL TEST RESULTS       ', 13, 10, '=============================', 13, 10, '$'
-    acc_msg db ' Accuracy     : $'
-    speed_msg db 13, 10, ' Typing Speed : $'
-    time_msg db 13, 10, ' Total Time   : $'
-    res_bot db 13, 10, '=============================', 13, 10, '$'
-    
-    cpm_unit db ' CPM$'
-    sec_unit db ' sec$'
-    
-    user_input db 100 dup('$') 
-    start_time dw 0
-    end_time dw 0
-    elapsed_secs dw 0
+
+    ; --- Final result UI ----------------------------------------------------
+    res_top     db 13, 10, 13, 10, '=============================', 13, 10, '    FINAL TEST RESULTS       ', 13, 10, '=============================', 13, 10, '$'
+    acc_msg     db ' Accuracy     : $'
+    speed_msg   db 13, 10, ' Typing Speed : $'
+    wpm_msg     db 13, 10, ' Speed (WPM)  : $'
+    correct_msg db 13, 10, ' Correct      : $'
+    errors_msg  db 13, 10, ' Errors       : $'
+    time_msg    db 13, 10, ' Total Time   : $'
+    res_bot     db 13, 10, '=============================', 13, 10, '$'
+    cpm_unit    db ' CPM$'
+    wpm_unit    db ' WPM$'
+    sec_unit    db ' sec$'
+
+    ; --- Per-round breakdown UI --------------------------------------------
+    rounds_hdr db 13, 10, ' Per-round results:', 13, 10, '$'
+    rb_label   db '   Round $'
+    rb_colon   db ' : $'
+    rb_open    db '   ($'
+    crlf_msg   db 13, 10, '$'
+
+    ; --- Scratch for the colour-echo subroutine ----------------------------
+    tmp_char db 0
+    tmp_attr db 0
+
+    ; --- Input buffer and timing -------------------------------------------
+    MAX_INPUT      equ 100
+    user_input     db MAX_INPUT dup('$')
+    start_time     dw 0
+    end_time       dw 0
+    elapsed_secs   dw 0         ; whole seconds (used by CPM/WPM)
+    elapsed_tenths dw 0         ; tenths of a second (used for "12.4 sec")
 
 .code
 main proc
     mov ax, @data
     mov ds, ax
 
-    ; 1. 시작 화면 출력
+    ; 1. Intro (shown once, skipped on retry).
     lea dx, welcome_msg
     mov ah, 09h
     int 21h
     lea dx, prompt_msg
     mov ah, 09h
     int 21h
-
-    ; 2. 대기 
     mov ah, 07h
     int 21h
 
-    ; ==========================================
-    ; 3. [전체 타이머 시작] 라운드 진입 직전 시계 확인
-    ; ==========================================
+; -----------------------------------------------------------------------------
+;  RESTART POINT - the retry option jumps back here.
+; -----------------------------------------------------------------------------
+restart_point:
+    mov current_round, 0
+    mov total_typed, 0
+    mov total_correct, 0
+
+    ; 2. Countdown "3 2 1 START" (before the timer, so setup time is free).
+    mov ax, 0003h
+    int 10h
+    lea dx, count_msg
+    mov ah, 09h
+    int 21h
+
+    mov bl, '3'
+countdown_loop:
+    mov dl, bl
+    mov ah, 02h
+    int 21h
+    mov cx, 18              ; ~1 second
+    call delay_ticks
+    mov dl, 8
+    mov ah, 02h
+    int 21h
+    mov dl, ' '
+    mov ah, 02h
+    int 21h
+    mov dl, 8
+    mov ah, 02h
+    int 21h
+    dec bl
+    cmp bl, '0'
+    ja  countdown_loop
+    lea dx, start_msg
+    mov ah, 09h
+    int 21h
+    mov cx, 9              ; ~0.5 second on "START!"
+    call delay_ticks
+
+    ; 3. Start the overall timer.
     mov ah, 00h
     int 1Ah
     mov start_time, dx
 
 round_start:
-    ; 4. 화면 지우기 (매 라운드마다 깨끗하게 리셋)
+    ; 4. Clear screen.
     mov ax, 0003h
     int 10h
 
-    ; 5. "=== Round X / 3 ===" 상단 UI 출력
+    ; 5. "=== Round X / 3 ==="
     lea dx, round_msg
     mov ah, 09h
     int 21h
-    
     mov ax, current_round
-    inc ax             ; 0, 1, 2를 1, 2, 3으로 변환
-    add al, '0'        ; 문자로 변환
+    inc ax
+    add al, '0'
     mov dl, al
     mov ah, 02h
     int 21h
-    
     lea dx, round_max
     mov ah, 09h
     int 21h
 
-    ; 6. 배열에서 현재 라운드 제시문 주소 꺼내오기
+    ; 6. Pick this round's sentence.
     mov bx, current_round
-    shl bx, 1                   ; bx = bx * 2 (워드 단위 인덱스 계산)
+    shl bx, 1
     mov dx, target_ptrs[bx]
     mov selected_target, dx
     mov ah, 09h
-    int 21h                     ; 제시문 화면 출력
-
+    int 21h
     lea dx, input_prompt
     mov ah, 09h
     int 21h
 
-    mov si, 0                   ; 타자 수 초기화
+    mov si, 0
 
+; -----------------------------------------------------------------------------
+;  Input loop.  Read with NO echo (AH=08h) for full control of colour,
+;  Backspace, extended keys and ESC.  Far targets are reached via JMP so the
+;  conditional jumps stay inside their short-jump range.
+; -----------------------------------------------------------------------------
 input_loop:
-    mov ah, 01h      
-    int 21h          
-    
-    cmp al, 13                  ; 엔터 치면 해당 라운드 종료
-    je round_end    
-    
-    mov user_input[si], al  
-    
-    ; 실시간 오타 체크 (Beep)
-    mov bx, selected_target
-    push bx
-    add bx, si       
-    mov ah, [bx]     
-    pop bx
-    
-    cmp al, ah       
-    je correct_input 
-    
-    mov dl, 07h
-    mov ah, 02h
+    mov ah, 08h
     int 21h
 
-correct_input:
-    inc si           
-    jmp input_loop   
+    cmp al, 0               ; extended key (arrow, F-key, ...)?
+    jne il_chk_esc
+    mov ah, 08h             ; discard the following scan code
+    int 21h
+    jmp input_loop
+il_chk_esc:
+    cmp al, 27              ; ESC -> abort the whole program
+    jne il_chk_enter
+    jmp end_program
+il_chk_enter:
+    cmp al, 13              ; Enter -> finish round (but not if empty)
+    jne il_chk_bs
+    cmp si, 0
+    je  input_loop          ; empty-Enter guard: must type something
+    jmp round_end
+il_chk_bs:
+    cmp al, 8               ; Backspace
+    jne il_store
+    jmp handle_backspace
+il_store:
+    cmp si, MAX_INPUT-1     ; buffer full -> ignore
+    jae input_loop
+
+    mov user_input[si], al
+
+    ; Choose colour by comparing with the expected character.
+    mov bx, selected_target
+    add bx, si
+    mov ah, [bx]
+    cmp al, ah
+    je  echo_white
+    mov bl, 0Ch             ; bright red on black
+    call putchar_attr
+    mov dl, 07h             ; beep on mismatch
+    mov ah, 02h
+    int 21h
+    jmp next_char
+echo_white:
+    mov bl, 0Fh             ; bright white on black
+    call putchar_attr
+next_char:
+    inc si
+    jmp input_loop
+
+handle_backspace:
+    cmp si, 0
+    je input_loop
+    mov dl, 8
+    mov ah, 02h
+    int 21h
+    mov dl, ' '
+    mov ah, 02h
+    int 21h
+    mov dl, 8
+    mov ah, 02h
+    int 21h
+    dec si
+    jmp input_loop
 
 round_end:
-    ; ==========================================
-    ; 7. 현재 라운드 누적 채점
-    ; ==========================================
-    ; (1) 이번에 친 글자 수를 전체 타수에 더함
+    ; 7a. Accumulate typed count.
     mov ax, total_typed
     add ax, si
     mov total_typed, ax
 
-    ; (2) 정확도 채점 루프
+    ; 7b. Count exact matches into DI; CX keeps the typed count.
     mov bx, selected_target
-    mov cx, si      
-    mov si, 0       
-    mov di, 0       
-
+    mov cx, si
+    mov si, 0
+    mov di, 0
 compare_loop:
-    cmp si, cx      
-    je update_correct    
-
+    cmp si, cx
+    je update_correct
     mov al, user_input[si]
     push bx
     add bx, si
-    mov ah, [bx]    
+    mov ah, [bx]
     pop bx
-    
-    cmp al, ah               
-    jne skip_count           
-    inc di                   
-
+    cmp al, ah
+    jne skip_count
+    inc di
 skip_count:
-    inc si                   
-    jmp compare_loop         
-
+    inc si
+    jmp compare_loop
 update_correct:
-    ; 이번에 맞춘 글자 수를 전체 정답수에 더함
     mov ax, total_correct
     add ax, di
     mov total_correct, ax
 
-    ; 8. 다음 라운드로 이동
+    ; Store this round's stats into the per-round arrays.
+    mov bx, current_round
+    shl bx, 1
+    mov round_typed[bx], cx
+    mov round_correct[bx], di
+
     inc current_round
     cmp current_round, 3
-    jl round_start      ; 3라운드 미만이면 다음 라운드로 점프
+    jl round_start
 
 finish_all:
-    ; ==========================================
-    ; 9. [전체 타이머 종료] 3라운드가 모두 끝나면 시간 측정
-    ; ==========================================
+    ; 9. Stop timer; convert ticks to tenths-of-seconds and whole seconds.
     mov ah, 00h
     int 1Ah
     mov end_time, dx
 
     mov ax, end_time
-    sub ax, start_time
-    mov cx, 18
-    mov dx, 0
-    div cx
-    mov elapsed_secs, ax 
+    sub ax, start_time      ; AX = elapsed ticks
+    mov cx, 100
+    mul cx                  ; DX:AX = ticks * 100
+    mov cx, 182
+    div cx                  ; AX = tenths of seconds (18.2065 ticks/sec)
+    mov elapsed_tenths, ax
+    xor dx, dx
+    mov cx, 10
+    div cx                  ; AX = whole seconds, DX = .x digit (unused here)
+    mov elapsed_secs, ax
 
-    cmp elapsed_secs, 0
+    cmp elapsed_secs, 0     ; guard the CPM/WPM divisions
     jne calculate
-    mov elapsed_secs, 1 
+    mov elapsed_secs, 1
 
 calculate:
     cmp total_typed, 0
     je end_program
 
-    ; 10. 종합 결과창 UI 출력
     mov ax, 0003h
-    int 10h           ; 마지막 결과창을 위해 화면 한 번 더 깔끔하게 지우기
-    
+    int 10h
+
     lea dx, res_top
     mov ah, 09h
     int 21h
 
-    ; --- 전체 Accuracy 출력 ---
+    ; --- Overall accuracy (%) ---------------------------------------------
     lea dx, acc_msg
     mov ah, 09h
     int 21h
-    
     mov ax, total_correct
     mov cx, 100
-    mul cx        
-    mov dx, 0     
-    div total_typed        
-
+    mul cx
+    div total_typed
     call print_number
     mov dl, '%'
     mov ah, 02h
     int 21h
 
-    ; --- 종합 Typing Speed (CPM) 출력 ---
+    ; --- CPM ---------------------------------------------------------------
     lea dx, speed_msg
     mov ah, 09h
     int 21h
-
     mov ax, total_typed
     mov cx, 60
-    mul cx          
-    mov dx, 0
+    mul cx
     mov cx, elapsed_secs
-    div cx          
-    
+    div cx
     call print_number
     lea dx, cpm_unit
     mov ah, 09h
     int 21h
 
-    ; --- Total Time 출력 ---
+    ; --- WPM ---------------------------------------------------------------
+    lea dx, wpm_msg
+    mov ah, 09h
+    int 21h
+    mov ax, total_typed
+    mov cx, 12
+    mul cx
+    mov cx, elapsed_secs
+    div cx
+    call print_number
+    lea dx, wpm_unit
+    mov ah, 09h
+    int 21h
+
+    ; --- Correct / Errors counts ------------------------------------------
+    lea dx, correct_msg
+    mov ah, 09h
+    int 21h
+    mov ax, total_correct
+    call print_number
+
+    lea dx, errors_msg
+    mov ah, 09h
+    int 21h
+    mov ax, total_typed
+    sub ax, total_correct   ; errors = typed - correct
+    call print_number
+
+    ; --- Total time with one decimal place ("12.4 sec") -------------------
     lea dx, time_msg
     mov ah, 09h
     int 21h
-    
-    mov ax, elapsed_secs
-    call print_number
+    mov ax, elapsed_tenths
+    xor dx, dx
+    mov cx, 10
+    div cx                  ; AX = whole seconds, DX = fractional tenth
+    push dx                 ; save the fractional digit across the call
+    call print_number       ; print the integer part
+    mov dl, '.'
+    mov ah, 02h
+    int 21h
+    pop dx                  ; recover the fractional digit
+    add dl, '0'
+    mov ah, 02h
+    int 21h
     lea dx, sec_unit
     mov ah, 09h
     int 21h
 
+    ; --- Per-round breakdown:  "Round n : XX%   (correct/typed)" ----------
+    lea dx, rounds_hdr
+    mov ah, 09h
+    int 21h
+    mov si, 0               ; SI = round index 0..2
+perround_loop:
+    cmp si, 3
+    jae perround_done
+
+    lea dx, rb_label
+    mov ah, 09h
+    int 21h
+    mov ax, si              ; round number = index + 1
+    inc ax
+    add al, '0'
+    mov dl, al
+    mov ah, 02h
+    int 21h
+    lea dx, rb_colon
+    mov ah, 09h
+    int 21h
+
+    ; accuracy = round_correct * 100 / round_typed (guard typed = 0)
+    mov bx, si
+    shl bx, 1
+    mov ax, round_typed[bx]
+    cmp ax, 0
+    je  pr_zero
+    mov ax, round_correct[bx]
+    mov cx, 100
+    mul cx
+    mov cx, round_typed[bx]
+    div cx
+    jmp pr_show
+pr_zero:
+    mov ax, 0
+pr_show:
+    call print_number
+    mov dl, '%'
+    mov ah, 02h
+    int 21h
+
+    ; "   (correct/typed)"
+    lea dx, rb_open
+    mov ah, 09h
+    int 21h
+    mov bx, si
+    shl bx, 1
+    mov ax, round_correct[bx]
+    call print_number
+    mov dl, '/'
+    mov ah, 02h
+    int 21h
+    mov bx, si
+    shl bx, 1
+    mov ax, round_typed[bx]
+    call print_number
+    mov dl, ')'
+    mov ah, 02h
+    int 21h
+    lea dx, crlf_msg
+    mov ah, 09h
+    int 21h
+
+    inc si
+    jmp perround_loop
+perround_done:
+
     lea dx, res_bot
     mov ah, 09h
     int 21h
+
+    ; 11. Retry / quit prompt.
+    lea dx, again_msg
+    mov ah, 09h
+    int 21h
+ask_again:
+    mov ah, 07h
+    int 21h
+    cmp al, 27
+    je  end_program
+    cmp al, 'r'
+    je  restart_point
+    cmp al, 'R'
+    je  restart_point
+    jmp ask_again
 
 end_program:
     mov ah, 4Ch
     int 21h
 main endp
 
-; =========================================
-; 숫자 출력 함수 (서브루틴)
-; =========================================
+; =============================================================================
+;  print_number : print unsigned AX as decimal ASCII. All registers preserved.
+; =============================================================================
 print_number proc
-    mov cx, 0       
-    mov bx, 10      
-
+    push ax
+    push bx
+    push cx
+    push dx
+    mov cx, 0
+    mov bx, 10
 divide_loop:
     mov dx, 0
-    div bx          
-    push dx         
-    inc cx          
-    cmp ax, 0       
+    div bx
+    push dx
+    inc cx
+    cmp ax, 0
     jne divide_loop
-
 print_digits:
-    pop dx          
-    add dl, '0'     
-    mov ah, 02h     
+    pop dx
+    add dl, '0'
+    mov ah, 02h
     int 21h
-    loop print_digits 
+    loop print_digits
+    pop dx
+    pop cx
+    pop bx
+    pop ax
     ret
 print_number endp
+
+; =============================================================================
+;  delay_ticks : busy-wait for CX BIOS timer ticks (~CX/18.2 s). Regs preserved.
+; =============================================================================
+delay_ticks proc
+    push ax
+    push bx
+    push dx
+    mov ah, 00h
+    int 1Ah
+    mov bx, dx
+dt_wait:
+    mov ah, 00h
+    int 1Ah
+    sub dx, bx
+    cmp dx, cx
+    jb  dt_wait
+    pop dx
+    pop bx
+    pop ax
+    ret
+delay_ticks endp
+
+; =============================================================================
+;  putchar_attr : write AL with attribute BL at the cursor and advance it.
+;  INT 10h/03h (read cursor) -> INT 10h/09h (write char+attr, no move) ->
+;  INT 10h/02h (move cursor, with line wrap). All registers preserved.
+; =============================================================================
+putchar_attr proc
+    push ax
+    push bx
+    push cx
+    push dx
+    mov tmp_char, al
+    mov tmp_attr, bl
+
+    mov ah, 03h
+    mov bh, 0
+    int 10h                 ; DH=row, DL=col
+
+    mov al, tmp_char
+    mov bl, tmp_attr
+    mov bh, 0
+    mov cx, 1
+    mov ah, 09h
+    int 10h
+
+    inc dl
+    cmp dl, 80
+    jb  set_cur
+    mov dl, 0
+    inc dh
+set_cur:
+    mov ah, 02h
+    mov bh, 0
+    int 10h
+
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+putchar_attr endp
 
 end main
